@@ -3,6 +3,7 @@ os.environ['KMP_DUPLICATE_LIB_OK']='True'
 import math
 import torch
 import torch.nn as nn
+from torchvision.ops import roi_align
 
 from model.backnone import Resnet, EfficientNet, MobileNet
 # from backnone import Resnet, EfficientNet, MobileNet
@@ -36,12 +37,60 @@ class CenterNetHead(nn.Module):
             )
 
     def forward(self, x):
-        hm = self.cls_head(x)
-        wh = self.wh_head(x)
-        offset = self.offset_head(x)
+        # fp32 regardless of autocast. These heads regress raw box sizes out of an
+        # unnormalised decoder sum, and in fp16 that overflows into the BatchNorms'
+        # running stats, which GradScaler does not cover (see trainer.py's use_amp note).
+        # Partial mitigation only: it moved the first failure from step 29 to step 225,
+        # it does not prevent it, because by then the decoder has already produced inf.
+        # Kept because it costs nothing - three convs at stride 4 next to a ResNet50.
+        with torch.autocast(x.device.type, enabled=False):
+            x = x.float()
+            hm = self.cls_head(x)
+            wh = self.wh_head(x)
+            offset = self.offset_head(x)
 
         return hm, wh, offset
     
+class RoIClassifier(nn.Module):
+    def __init__(self, num_classes, in_channel=256, channel=256, out_size=7, stride=4):
+        """
+        Second stage: pool the shared feature map over each box and classify it.
+
+        The detector reads its class from the single feature-map cell at the box
+        center, while a median box spans ~29 cells. This pools the whole extent
+        instead. Measured on ground-truth crops (DATASET.md 14.2), a dedicated
+        classifier reaches 73.6% on the 9 confusable container classes at the detail
+        the stride-4 map already carries, and re-cropping from the original image at
+        full resolution only adds ~3 points - which is why this reuses the feature
+        map rather than running a second backbone over N crops.
+        """
+        super().__init__()
+        self.out_size = out_size
+        self.spatial_scale = 1.0 / stride
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channel, channel, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channel),
+            nn.Mish(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channel, num_classes),
+        )
+
+    def forward(self, feat, rois):
+        '''feat: (n, c, h, w) decoder output. rois: list of (Ni, 4) xyxy in input pixels.'''
+        # fp32 regardless of autocast: MPS has no fp16 roi_align backward, and boxes
+        # must match the feature dtype anyway. This head is a few hundred boxes wide,
+        # so keeping it out of autocast costs nothing measurable.
+        with torch.autocast(feat.device.type, enabled=False):
+            feat = feat.float()
+            rois = [r.float() for r in rois]
+            pooled = roi_align(feat, rois, output_size=self.out_size,
+                               spatial_scale=self.spatial_scale, aligned=True)
+            if pooled.shape[0] == 0:
+                return pooled.new_zeros((0, self.net[-1].out_features))
+            return self.net(pooled)
+
+
 class CenterNetPoolingNMS(nn.Module):
     def __init__(self, kernel=3):
         """
@@ -68,39 +117,8 @@ class CenterNetDecoder(nn.Module):
 
         self.in_channels = in_channels
 
-        # h/32, w/32, 2048 -> h/16, w/16, 256 -> h/8, w/8, 128 -> h/4, w/4, 64
-        # self.dconv1 = nn.ConvTranspose2d(in_channels=self.in_channels,
-        #                                 out_channels=256,
-        #                                 kernel_size=4,
-        #                                 stride=2,
-        #                                 padding=1,
-        #                                 output_padding=0,
-        #                                 bias=False)
-        
-        # self.dconv2 = nn.ConvTranspose2d(in_channels=256,
-        #                                 out_channels=128,
-        #                                 kernel_size=4,
-        #                                 stride=2,
-        #                                 padding=1,
-        #                                 output_padding=0,
-        #                                 bias=False)
-        
-        # self.dconv3 = nn.ConvTranspose2d(in_channels=128,
-        #                                 out_channels=64,
-        #                                 kernel_size=4,
-        #                                 stride=2,
-        #                                 padding=1,
-        #                                 output_padding=0,
-        #                                 bias=False)
-        
-        # self.dconv4 = nn.ConvTranspose2d(in_channels=64,
-        #                                 out_channels=64,
-        #                                 kernel_size=4,
-        #                                 stride=2,
-        #                                 padding=1,
-        #                                 output_padding=0,
-        #                                 bias=False)
-        output_size = 256 
+        # h/32, w/32, 2048 -> h/16, w/16 -> h/8, w/8 -> h/4, w/4 -> h/2, w/2
+        output_size = 256
         self.conv4 = nn.Conv2d(self.in_channels, output_size, kernel_size=1, stride=1, padding=0, bias=False)
         self.up4 = nn.Upsample(scale_factor=2, mode='nearest')
         self.c4 = nn.Conv2d(output_size, output_size, kernel_size=3, stride=1, padding=1, bias=False)
@@ -114,8 +132,7 @@ class CenterNetDecoder(nn.Module):
         self.up2 = nn.Upsample(scale_factor=2, mode='nearest')
         
         self.conv1 = nn.Conv2d(256, output_size, kernel_size=1, stride=1, padding=0, bias=False)
-        self.up1 = nn.Upsample(scale_factor=2, mode='nearest')
-       
+
         self.output = nn.Conv2d(output_size, output_size, kernel_size=3, stride=1, padding=1, bias=False)
 
     def forward(self, c1, c2, c3, c4):
@@ -129,21 +146,24 @@ class CenterNetDecoder(nn.Module):
         x = self.c3(x)
         x = self.up3(x) + self.conv2(c2)
         x = self.up2(x) + self.conv1(c1)
-        x = self.up1(x)
+        # Stops at c1's resolution: output stride 4. Measured on this dataset, going
+        # finer than /4 buys nothing (2 boxes out of 32189 collide at /4, 0 at /2)
+        # and quadruples the heatmap memory.
         x = self.output(x)
-
 
         return x
     
 class CenterNet(nn.Module):
-    def __init__(self, num_classes=2):
+    def __init__(self, num_classes=2, roi_head=True):
         """
         Args:
             num_classes: int
+            roi_head: add the second-stage RoI classifier
         """
         super(CenterNet, self).__init__()
 
-        self.conv = nn.Conv2d(in_channels=1, out_channels=3, kernel_size=1, padding=0, bias=False)
+        # RGB in. The old 1->3 conv adapter existed only to feed grayscale to an
+        # ImageNet backbone; with real colour it just discards information.
         # h, w, 3 -> h/32, w/32, 2048
         # self.backbone = EfficientNet() 
         self.backbone = Resnet()
@@ -159,8 +179,13 @@ class CenterNet(nn.Module):
         # offset channel: 2
         self.head = CenterNetHead(in_channel=256, channel=64, num_classes=num_classes)
 
+        self.roi_head = RoIClassifier(num_classes, in_channel=256) if roi_head else None
+
         # self.centerPool = CenterNetPoolingNMS(kernel=3)
-        for m in self.modules():
+        # Only the from-scratch parts. Running this over self.modules() would also hit the
+        # backbone and throw away the ImageNet weights we just loaded.
+        for m in [*self.decoder.modules(), *self.head.modules(),
+                  *(self.roi_head.modules() if roi_head else [])]:
             if isinstance(m, nn.Conv2d):
                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
                 m.weight.data.normal_(0, math.sqrt(2. / n))
@@ -171,14 +196,20 @@ class CenterNet(nn.Module):
         self.head.cls_head[-2].weight.data.fill_(0)
         self.head.cls_head[-2].bias.data.fill_(-2.19)
 
-    def forward(self, x):
-        x = self.conv(x)
-        c1, c2, c3, c4 = self.backbone(x)
-        x = self.decoder(c1, c2, c3, c4)
+    def forward(self, x, rois=None):
+        '''rois: list of (Ni, 4) xyxy boxes in input pixels, one entry per image.
 
-        hms_pred, whs_pred, offsets_pred = self.head(x)
+        Without rois this returns the three detection heads, which keeps torch.jit.trace
+        and the onnx export unchanged. With rois it also returns the RoI logits.
+        '''
+        c1, c2, c3, c4 = self.backbone(x)
+        feat = self.decoder(c1, c2, c3, c4)
+
+        hms_pred, whs_pred, offsets_pred = self.head(feat)
         # hms_pred = self.centerPool(hms_pred)
-        return hms_pred, whs_pred, offsets_pred
+        if rois is None or self.roi_head is None:
+            return hms_pred, whs_pred, offsets_pred
+        return hms_pred, whs_pred, offsets_pred, self.roi_head(feat, rois)
         
     
 if __name__ == "__main__":

@@ -5,42 +5,6 @@ import torch
 import torch.nn as nn
 from torchvision import models
 
-def activation_func(activation):
-    return nn.ModuleDict({
-        'selu': nn.SELU(inplace=True),
-        'relu': nn.ReLU(inplace=True),
-        'leaky_relu': nn.LeakyReLU(negative_slope=0.01, inplace=True),
-        'sigmoid': nn.Sigmoid(),
-        'prelu': nn.PReLU(),
-        'softmax': nn.Softmax(dim=1),
-        'gelu': nn.GELU()})[activation]
-
-class DWCNNBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, padding, stride=1):
-        super(DWCNNBlock, self).__init__()
-        self.depth_conv = nn.Conv2d(in_channels=in_ch,
-                                    out_channels=in_ch,
-                                    kernel_size=kernel_size,
-                                    stride=stride,
-                                    padding=padding,
-                                    groups=in_ch,
-                                    bias=False)
-        
-        self.point_conv = nn.Conv2d(in_channels=in_ch,
-                                    out_channels=out_ch,
-                                    kernel_size=1,
-                                    stride=1,
-                                    padding=0,
-                                    groups=1,
-                                    bias=False)
-        
-        self.relu6 = nn.ReLU6(inplace=True)
-
-    def forward(self,input):
-        out = self.relu6(self.depth_conv(input))
-        out = self.point_conv(out)
-        return out
-
 class Resnet(nn.Module):
     def __init__(self, weights="IMAGENET1K_V1"):
         super().__init__()
@@ -69,16 +33,6 @@ class Resnet(nn.Module):
         l4 = self.layer4(l3)
 
         return l1, l2, l3, l4
-
-class MobileNet(nn.Module):
-    def __init__(self, weights="IMAGENET1K_V1"):
-        super().__init__()
-        backbone = models.mobilenet_v3_large(weights=weights)
-        print(backbone)
-        self.features = nn.Sequential(*list(backbone.children())[:-2])
-    def forward(self, x):
-        x = self.features(x)
-        return x
 
 class EfficientNet(nn.Module):
     def __init__(self, weights="IMAGENET1K_V1"):
@@ -110,9 +64,6 @@ class MobileNet(nn.Module):
         return outputs
      
 if __name__ == "__main__":
-
-    from torchinfo import summary
-    # DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     input = torch.randn(1, 3, 512, 512).to("cpu")
 

@@ -1,0 +1,12 @@
+numpy
+torch
+torchvision
+torch_optimizer
+opencv-python
+tqdm
+
+# imgaug is gone: unmaintained since 2020, it pinned numpy below 2 and only ever
+# applied one operator per image. pt_dataset.dataUtils.Augment replaces it with cv2.
+
+# torch2onnx.py uses torch.onnx, which ships with torch, so the onnx package is not needed.
+# tensorrt is install-specific (CUDA/platform), install it separately for onnx2trt.py

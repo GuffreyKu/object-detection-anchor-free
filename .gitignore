@@ -1,0 +1,10 @@
+data/
+.env
+.DS_Store
+__pycache__/
+*.py[cod]
+savemodel/
+eval_fig/
+*.pkl
+*.onnx
+*.trt

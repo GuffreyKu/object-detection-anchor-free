@@ -2,69 +2,44 @@ import torch
 import cv2
 import pickle
 import random
-import matplotlib.pyplot as plt
-from utils.tool import read_imgTotensor, predict, draw_bbox
+from utils.tool import read_imgTotensor, predict_full, draw_bbox, load_annotation
+from utils.pytorchtools import get_device
+from model.centerNet import CenterNet
 
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+DEVICE = get_device()
 
-
-train_path = "data/train.pkl"
 valid_path = "data/valid.pkl"
+annotation_path = "data/train_dataset/train_label.json"
+model_path = "savemodel/model.pth"
 
 image_size = (512, 512)
 conf = 0.1
 nms_thres = 0.45
 
-color_map = {
-    0:(0, 0, 255),
-    1:(0, 255, 0)
-    }
-
-class_names = {
-            0:"dog",
-            1:"cat"
-        }
-
-model = torch.jit.load("savemodel/model_trace.pt")
-
-def resize_bbox(image_path, bbox, input_shape):
-    image = cv2.imread(image_path)
-    raw_h, raw_w, _ = image.shape
-    
-    ratio_w = input_shape[0]/raw_w
-    ratio_h = input_shape[1]/raw_h
-
-    resize_bbox = []
-    
-    nx = int(bbox[0] * ratio_w)
-    ny = int(bbox[1] * ratio_h) 
-    nw = int(bbox[2] * ratio_w) 
-    nh = int(bbox[3] * ratio_h) 
-    
-    resize_bbox.append([nx, ny, nx+nw, ny+nh])
-
-    return resize_bbox
-
 if __name__ == "__main__":
-    data_path = "data/v1/"
-    with open(train_path, 'rb') as file:
+    _, names = load_annotation(annotation_path)
+    class_names = dict(enumerate(names))
+    # Distinct-ish colour per class without hand-listing 34 of them.
+    color_map = {i: (37 * i % 256, 91 * i % 256, 173 * i % 256) for i in range(len(names))}
+
+    with open(valid_path, 'rb') as file:
         valid_annotation = pickle.load(file)
 
-    annotation_item = random.sample(valid_annotation, 1)
-    
-    print(annotation_item)
-    image_path = annotation_item[0]["path"]
-    name = image_path.split('/')[-1]
-    image_path = data_path+name
+    annotation_item = random.choice(valid_annotation)
+
+    image_path = annotation_item["path"]
     print(image_path)
-    categories = annotation_item[0]["bbox"]
-    print(categories)
-    
+    print(annotation_item["bbox"], annotation_item["labels"])
+
     image, input_data = read_imgTotensor(image_path, image_size)
-    
+
+    # State dict, not the traced model: tracing captures only the rois=None branch,
+    # so a traced model cannot run the second stage.
+    model = CenterNet(num_classes=len(names)).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
     with torch.no_grad():
-        outputs = predict(input_data, image_size, conf, nms_thres, model, DEVICE)
+        outputs = predict_full(model, input_data, image_size, conf, nms_thres, DEVICE)
 
     if len(outputs) > 0:
         outputs = outputs.data.cpu().numpy()
@@ -72,7 +47,9 @@ if __name__ == "__main__":
         scores = outputs[:, 4]
         bboxes = outputs[:, :4]
 
-        image = draw_bbox(image, bboxes, labels, class_names, color_map, scores=scores, show_name=True)
+        # read_imgTotensor hands back RGB, cv2.imwrite wants BGR.
+        image = draw_bbox(cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+                          bboxes, labels, class_names, color_map, scores=scores, show_name=True)
         cv2.imwrite("data/test.png", image)
     else:
         print(" nothing!! ")

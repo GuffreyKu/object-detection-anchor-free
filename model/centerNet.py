@@ -5,8 +5,7 @@ import torch
 import torch.nn as nn
 from torchvision.ops import roi_align
 
-from model.backnone import Resnet, EfficientNet, MobileNet
-# from backnone import Resnet, EfficientNet, MobileNet
+from model.backnone import build_backbone
 
 
 class CenterNetHead(nn.Module):
@@ -38,11 +37,13 @@ class CenterNetHead(nn.Module):
 
     def forward(self, x):
         # fp32 regardless of autocast. These heads regress raw box sizes out of an
-        # unnormalised decoder sum, and in fp16 that overflows into the BatchNorms'
-        # running stats, which GradScaler does not cover (see trainer.py's use_amp note).
-        # Partial mitigation only: it moved the first failure from step 29 to step 225,
-        # it does not prevent it, because by then the decoder has already produced inf.
-        # Kept because it costs nothing - three convs at stride 4 next to a ResNet50.
+        # unnormalised decoder sum, and that feeds BatchNorms whose running stats are
+        # updated in the forward pass, where GradScaler cannot protect them (see
+        # trainer.py's use_amp note). Under fp16 this was only a partial mitigation - it
+        # moved the first failure from step 29 to step 225 but could not prevent it,
+        # because the inf arrived already formed; bf16 is what actually prevents it.
+        # Kept because it costs nothing - three convs at stride 4 next to a ResNet50 -
+        # and running_var is a square, so it is the one place worth keeping full range.
         with torch.autocast(x.device.type, enabled=False):
             x = x.float()
             hm = self.cls_head(x)
@@ -112,34 +113,49 @@ class CenterNetPoolingNMS(nn.Module):
         return x * keep
     
 class CenterNetDecoder(nn.Module):
-    def __init__(self, in_channels, bn_momentum=0.1):
+    def __init__(self, in_channels, output_size=256, bn_momentum=0.1):
+        """
+        in_channels: (c1, c2, c3, c4), the backbone's four widths at strides 4/8/16/32.
+                     Pass backbone.out_channels - (256, 512, 1024, 2048) for resnet50,
+                     (96, 192, 384, 768) for swin_t.
+
+        bn_momentum is unused: this decoder deliberately has no normalisation at all.
+        Kept so the signature does not change under callers that still pass it.
+        """
         super(CenterNetDecoder, self).__init__()
 
-        self.in_channels = in_channels
+        if isinstance(in_channels, int):
+            raise TypeError(
+                "CenterNetDecoder takes the backbone's four lateral widths, not just "
+                "c4. Pass backbone.out_channels, e.g. (256, 512, 1024, 2048) for "
+                "resnet50 or (96, 192, 384, 768) for swin_t.")
 
-        # h/32, w/32, 2048 -> h/16, w/16 -> h/8, w/8 -> h/4, w/4 -> h/2, w/2
-        output_size = 256
-        self.conv4 = nn.Conv2d(self.in_channels, output_size, kernel_size=1, stride=1, padding=0, bias=False)
+        c1, c2, c3, c4 = self.in_channels = tuple(in_channels)
+
+        # stride 32 -> 16 -> 8 -> 4. The lateral widths come from the backbone; the rest
+        # of this, including the absence of any norm or activation, is unchanged.
+        self.conv4 = nn.Conv2d(c4, output_size, kernel_size=1, stride=1, padding=0, bias=False)
         self.up4 = nn.Upsample(scale_factor=2, mode='nearest')
         self.c4 = nn.Conv2d(output_size, output_size, kernel_size=3, stride=1, padding=1, bias=False)
 
-        self.conv3 = nn.Conv2d(1024, output_size, kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv3 = nn.Conv2d(c3, output_size, kernel_size=1, stride=1, padding=0, bias=False)
         self.up3 = nn.Upsample(scale_factor=2, mode='nearest')
 
         self.c3 = nn.Conv2d(output_size, output_size, kernel_size=3, stride=1, padding=1, bias=False)
 
-        self.conv2 = nn.Conv2d(512, output_size, kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv2 = nn.Conv2d(c2, output_size, kernel_size=1, stride=1, padding=0, bias=False)
         self.up2 = nn.Upsample(scale_factor=2, mode='nearest')
-        
-        self.conv1 = nn.Conv2d(256, output_size, kernel_size=1, stride=1, padding=0, bias=False)
+
+        self.conv1 = nn.Conv2d(c1, output_size, kernel_size=1, stride=1, padding=0, bias=False)
 
         self.output = nn.Conv2d(output_size, output_size, kernel_size=3, stride=1, padding=1, bias=False)
 
     def forward(self, c1, c2, c3, c4):
-        # c4 = [1, 2048, 8, 8], [1, 2048, 16, 16]
-        # c3 = [1, 1024, 16, 16], [1, 1024, 32, 32]
-        # c2 = [1, 512, 32, 32], [1, 512, 64, 64]
-        # c1 = [1, 256, 64, 64], [1, 256, 128, 128]
+        # Shapes for a 512x512 input, resnet50 / swin_t:
+        # c4 = [1, 2048, 16, 16] / [1,  768, 16, 16]
+        # c3 = [1, 1024, 32, 32] / [1,  384, 32, 32]
+        # c2 = [1,  512, 64, 64] / [1,  192, 64, 64]
+        # c1 = [1, 256,128,128]  / [1,   96,128,128]
         x = self.conv4(c4)
         x = self.up4(x)
         x = self.c4(x) + self.conv3(c3)
@@ -154,24 +170,34 @@ class CenterNetDecoder(nn.Module):
         return x
     
 class CenterNet(nn.Module):
-    def __init__(self, num_classes=2, roi_head=True):
+    def __init__(self, num_classes=2, backbone="swin_t", roi_head=True):
         """
         Args:
             num_classes: int
+            backbone: a name from model.backnone.BACKBONES, or a ready nn.Module
+                      exposing out_channels=(c1, c2, c3, c4) at strides 4/8/16/32.
+                      Default swin_t: +5.3 ImageNet points over resnet50, for a longer
+                      step and more activation memory (see README).
+                      Backbone weights are NOT transferable between choices - the
+                      checkpoints under savemodel/ belong to whichever one wrote them,
+                      and utils.pytorchtools says so by name when they do not match.
             roi_head: add the second-stage RoI classifier
         """
         super(CenterNet, self).__init__()
 
         # RGB in. The old 1->3 conv adapter existed only to feed grayscale to an
         # ImageNet backbone; with real colour it just discards information.
-        # h, w, 3 -> h/32, w/32, 2048
-        # self.backbone = EfficientNet() 
-        self.backbone = Resnet()
-        # self.backbone = MobileNet()
+        self.backbone_name = backbone if isinstance(backbone, str) else type(backbone).__name__
+        self.backbone = build_backbone(backbone)
 
+        if len(self.backbone.out_channels) != 4:
+            raise ValueError(
+                f"{self.backbone_name} declares {len(self.backbone.out_channels)} "
+                f"feature levels; the decoder needs exactly 4, at strides 4/8/16/32")
 
-        # h/32, w/32, 2048 -> h/4, w/4, 64
-        self.decoder = CenterNetDecoder(2048)
+        # four levels -> one map at stride 4, 256 channels. pt_dataset/dataset.py and
+        # RoIClassifier below both hardcode that 4.
+        self.decoder = CenterNetDecoder(self.backbone.out_channels)
 
         # feature height and width: h/4, w/4
         # hm channel: num_classes

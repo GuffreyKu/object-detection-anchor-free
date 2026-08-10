@@ -23,7 +23,8 @@ batch_size = 16
 input_shape = (512, 512)
 epochs = 150
 model_path = "savemodel"
-use_amp = False         # see the note in trainer.py: fp16 poisons BatchNorm running stats
+use_amp = True          # bf16 where available; see the note in trainer.py
+backbone = "swin_t"     # any name from model.backnone.BACKBONES
 
 annotation_path = "data/train_dataset/train_label.json"
 valid_ratio = 0.2
@@ -42,7 +43,9 @@ train_loader, valid_loader, train_sampler, valid_sampler = dataloader(train=trai
     
 criterion = TotalLoss().to(DEVICE)
     
-model = CenterNet(num_classes=num_classes).to(DEVICE)
+model = CenterNet(num_classes=num_classes, backbone=backbone).to(DEVICE)
+# No-op on a swin backbone, which is all LayerNorm - it still converts the BatchNorms in
+# the decoder, the heads and the RoI classifier, which is the point.
 model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
 model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
@@ -102,17 +105,18 @@ if __name__ == "__main__":
         b_train_loss = all_reduce_mean(b_train_loss, DEVICE)
         b_valid_loss = all_reduce_mean(b_valid_loss, DEVICE)
         map1 = all_reduce_mean(map1, DEVICE)
-        map2 = all_reduce_mean(map2, DEVICE)
+        map2 = all_reduce_mean(map2, DEVICE) if map2 is not None else None
 
         if local_rank == 0:
-            print(f"epoch {e}: loss {b_valid_loss:.3f}  mAP@0.5 stage1 {map1:.4f} -> reranked {map2:.4f}")
+            print(f"epoch {e}: loss {b_valid_loss:.3f}  mAP@0.5 {map1:.4f}" + (f"  reranked {map2:.4f}" if map2 is not None else ""))
         train_losses.append(b_train_loss)
         valid_losses.append(b_valid_loss)
         # Every rank runs this on identical numbers, so they all break on the same epoch.
         early_stopping(b_valid_loss)
 
-        if map2 >= best:
-            best = map2
+        # Stage-1, matching trainer.py: the rerank measured 4.5 points worse.
+        if map1 >= best:
+            best = map1
             if local_rank == 0:
                 torch.save(model.module.state_dict(), model_path+'/model.pth')
                 input_x = torch.rand(1, 3, input_shape[1], input_shape[0]).to(DEVICE)

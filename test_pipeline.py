@@ -236,6 +236,72 @@ def test_roi_head_shapes_and_rerank():
     assert (out[0, :4] == dets[0, :4]).all(), "rerank moved the box"
 
 
+def test_every_backbone_gives_four_levels_at_stride_4_8_16_32():
+    """
+    A backbone with the wrong taps does not raise, it mis-trains.
+
+    pt_dataset/dataset.py encodes targets at stride 4 and RoIClassifier pools at
+    spatial_scale 1/4, both hardcoded. A backbone whose finest level is stride 8 still
+    produces a heatmap, just one that disagrees with its targets by a factor of two --
+    which is what the old EfficientNet taps {3,5,7,8} did (strides 8/16/32/32). Built
+    with weights=None so this test downloads nothing.
+    """
+    import torch as t
+    from model.backnone import BACKBONES, build_backbone
+
+    size = 128
+    x = t.rand(1, 3, size, size)
+    for name in BACKBONES:
+        net = build_backbone(name, weights=None).eval()
+        with t.no_grad():
+            outs = net(x)
+        assert len(outs) == 4, f"{name} returned {len(outs)} levels, want 4"
+        strides = [size // o.shape[-1] for o in outs]
+        assert strides == [4, 8, 16, 32], f"{name} strides {strides}, want [4, 8, 16, 32]"
+        widths = tuple(o.shape[1] for o in outs)
+        assert widths == tuple(net.out_channels), \
+            f"{name} emits {widths} but declares out_channels={tuple(net.out_channels)}"
+
+
+def test_autocast_dtype_survives_the_unnormalised_decoder():
+    """
+    The head BatchNorms are updated in the forward pass, where GradScaler cannot reach
+    them, so an overflow in the decoder's unnormalised four-level sum poisons
+    running_mean / running_var permanently - and because train() uses batch statistics,
+    it stays invisible until eval(). Guard the property that prevents it: the autocast
+    dtype must carry an activation past fp16's 65504 ceiling.
+    """
+    import torch as t
+    from utils.pytorchtools import amp_dtype, assert_finite
+    from model.centerNet import CenterNet
+
+    assert amp_dtype(t.device("cpu")) is t.float16
+    if t.cuda.is_available():
+        dev = t.device("cuda:0")
+        want = t.bfloat16 if t.cuda.is_bf16_supported() else t.float16
+        assert amp_dtype(dev) is want, f"amp_dtype gave {amp_dtype(dev)}, want {want}"
+    else:
+        return      # the rest needs a GPU to autocast on
+
+    if not t.cuda.is_bf16_supported():
+        return      # fp16-only hardware: use_amp is expected to be False there
+
+    m = CenterNet(num_classes=5).to(dev).train()
+    # Drive the decoder past fp16's ceiling deliberately. This is the failure the run
+    # actually hit, just reached in one step instead of a few hundred.
+    with t.no_grad():
+        m.decoder.output.weight.mul_(3000.0)
+
+    x = t.rand(2, 3, 128, 128, device=dev)
+    with t.autocast(dev.type, dtype=amp_dtype(dev), enabled=True):
+        feat = m.decoder(*m.backbone(x))
+        peak = feat.abs().max().item()
+        assert peak > 65504, f"decoder peaked at {peak:.0f}, below fp16 max - raise the gain"
+        m.head(feat)
+
+    assert_finite(m)
+
+
 if __name__ == "__main__":
     test_roundtrip()
     test_topk_decode_keeps_both_classes()
@@ -247,4 +313,6 @@ if __name__ == "__main__":
     test_images_load_in_the_annotation_frame()
     test_aug_retangle_survives_an_out_of_bounds_box()
     test_roi_head_shapes_and_rerank()
+    test_every_backbone_gives_four_levels_at_stride_4_8_16_32()
+    test_autocast_dtype_survives_the_unnormalised_decoder()
     print("ok")

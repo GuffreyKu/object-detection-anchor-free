@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -72,10 +73,32 @@ def l1_loss(pred, target, mask):
 
     return loss
 
+def inverse_sqrt_class_weights(counts, clip=(0.25, 4.0)):
+    """
+    w_c proportional to 1/sqrt(n_c), normalised to mean 1 and clipped.
+
+    mAP averages AP with every class weighing 1/34 while the boxes are imbalanced 470:1,
+    so an unweighted mean-reduction cross entropy optimises a very different objective
+    from the one being scored. Inverse-sqrt rather than inverse-frequency, and clipped,
+    because the full 470x correction would put most of the gradient on a 13-box class.
+    """
+    counts = np.asarray(counts, np.float64)
+    w = 1.0 / np.sqrt(np.maximum(counts, 1.0))
+    w = w / w.mean()
+    return torch.tensor(np.clip(w, *clip), dtype=torch.float32)
+
+
 class TotalLoss(nn.Module):
-    def __init__(self, roi_weight=1.0):
+    def __init__(self, roi_weight=1.0, class_weights=None):
+        """
+        class_weights: optional (num_classes,) tensor for the second-stage cross entropy.
+                       Registered as a buffer so .to(DEVICE) moves it and it survives a
+                       state_dict round trip.
+        """
         super().__init__()
         self.roi_weight = roi_weight
+        self.register_buffer("class_weights",
+                             None if class_weights is None else class_weights.float())
 
     def forward(self, prediction:dict, groundTrue:dict):
         c_loss = focal_loss(prediction["hms"], groundTrue["hms"])
@@ -88,7 +111,8 @@ class TotalLoss(nn.Module):
         # the heatmap never make them do (DATASET.md 12.3).
         logits = prediction.get("roi_logits")
         if logits is not None and logits.shape[0] > 0:
-            loss = loss + self.roi_weight * F.cross_entropy(logits, groundTrue["roi_labels"])
+            loss = loss + self.roi_weight * F.cross_entropy(
+                logits, groundTrue["roi_labels"], weight=self.class_weights)
 
         return loss
 

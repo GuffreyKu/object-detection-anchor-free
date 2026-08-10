@@ -26,6 +26,7 @@ import torch_optimizer as optim_alg
 # __main__, so importing it just gets the constants.
 from trainer import (annotation_path, batch_size, epochs, input_shape, model_path,
                      use_amp, valid_ratio)
+from check_remote import net_setup
 from flow.flow import evaluate, train
 from model.centerNet import CenterNet
 from model.loss import TotalLoss
@@ -139,11 +140,12 @@ def run_training(fp16_wire):
                                                 amp=scaler.is_enabled(),
                                                 num_classes=num_classes)
 
-        print(f"epoch {e}: loss {b_valid_loss:.3f}  mAP@0.5 stage1 {map1:.4f} -> reranked {map2:.4f}")
+        print(f"epoch {e}: loss {b_valid_loss:.3f}  mAP@0.5 {map1:.4f}" + (f"  reranked {map2:.4f}" if map2 is not None else ""))
         early_stopping(b_valid_loss)
 
-        if map2 >= best:
-            best = map2
+        # Stage-1, matching trainer.py: the rerank measured 4.5 points worse.
+        if map1 >= best:
+            best = map1
             print(ev.report(class_names))
             # ponytail: state_dict only. The torchscript trace trainer.py also writes
             # would be pinned to the remote's CUDA device; run torch2onnx.py locally
@@ -163,12 +165,19 @@ def main():
                    help="address of the GPU box (rank 0), same value on both sides")
     p.add_argument("--port", type=int, default=int(os.environ.get("MASTER_PORT", 29500)))
     p.add_argument("--fp32-wire", action="store_true", help="do not compress batches to fp16")
+    p.add_argument("--timeout", type=int, default=300,
+                   help="seconds before an RPC gives up. A ~50MB fp16 batch needs this "
+                        "well above the 60s default, but not so high that a dead link "
+                        "looks like a slow one - run check_remote.py if it trips.")
+    p.add_argument("--iface", default=None,
+                   help="network interface facing the peer, e.g. ppp0 / utun3 / eth0. "
+                        "Needed on a multi-homed host - see check_remote.net_setup().")
     args = p.parse_args()
+    net_setup(args.addr, args.iface)
 
-    # A batch is ~100MB, so the 60s default timeout is not enough on a slow link.
     opts = rpc.TensorPipeRpcBackendOptions(
         init_method=f"tcp://{args.addr}:{args.port}",
-        rpc_timeout=1800,
+        rpc_timeout=args.timeout,
         num_worker_threads=16,
     )
 

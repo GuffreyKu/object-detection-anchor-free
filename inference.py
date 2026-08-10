@@ -3,7 +3,7 @@ import cv2
 import pickle
 import random
 from utils.tool import read_imgTotensor, predict_full, draw_bbox, load_annotation
-from utils.pytorchtools import get_device
+from utils.pytorchtools import get_device, load_weights
 from model.centerNet import CenterNet
 
 DEVICE = get_device()
@@ -11,6 +11,8 @@ DEVICE = get_device()
 valid_path = "data/valid.pkl"
 annotation_path = "data/train_dataset/train_label.json"
 model_path = "savemodel/model.pth"
+# Must match the backbone that wrote model_path, or load_weights says so by name.
+backbone = "swin_t"
 
 image_size = (512, 512)
 conf = 0.1
@@ -35,8 +37,8 @@ if __name__ == "__main__":
 
     # State dict, not the traced model: tracing captures only the rois=None branch,
     # so a traced model cannot run the second stage.
-    model = CenterNet(num_classes=len(names)).to(DEVICE)
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model = CenterNet(num_classes=len(names), backbone=backbone).to(DEVICE)
+    load_weights(model, torch.load(model_path, map_location=DEVICE), model_path)
     model.eval()
     with torch.no_grad():
         outputs = predict_full(model, input_data, image_size, conf, nms_thres, DEVICE)

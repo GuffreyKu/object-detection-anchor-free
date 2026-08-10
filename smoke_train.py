@@ -50,7 +50,10 @@ if __name__ == "__main__":
     model = CenterNet(num_classes=num_classes).to(DEVICE)
     criterion = TotalLoss().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scaler = make_scaler(DEVICE, enabled=False)   # matches trainer.py; see its use_amp note
+    # On, to match trainer.py. This is the only place the mixed-precision path is
+    # exercised before a real run, and it is the path that once silently poisoned the
+    # head BatchNorms - assert_finite() below is what catches that, per epoch.
+    scaler = make_scaler(DEVICE, enabled=True)
     scheduler = CosineDecayWarmup(optimizer, lr=lr,
                                   warmup_len=len(train_loader),
                                   total_iters=epochs * len(train_loader))
@@ -66,9 +69,9 @@ if __name__ == "__main__":
         vl, map1, map2, ev = evaluate("valid", model, valid_loader, criterion, DEVICE,
                                       image_size=input_shape, amp=scaler.is_enabled(),
                                       num_classes=num_classes)
-        print(f"epoch {e:3}  train {tl:8.3f}  valid {vl:8.3f}  "
-              f"mAP stage1 {map1:.4f}  reranked {map2:.4f}", flush=True)
-        history.append((tl, map1, map2))
+        print(f"epoch {e:3}  train {tl:8.3f}  valid {vl:8.3f}  mAP stage1 {map1:.4f}"
+              + (f"  reranked {map2:.4f}" if map2 is not None else ""), flush=True)
+        history.append((tl, map1, map2 if map2 is not None else map1))
 
     print("\n" + ev.report(class_names))
 

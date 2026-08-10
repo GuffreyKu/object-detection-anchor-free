@@ -1,0 +1,14 @@
+[project]
+name = "aidea"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.1",
+    "opencv-python>=5.0.0.93",
+    "torch>=2.13.0",
+    "torch-optimizer>=0.3.0",
+    "torchvision>=0.28.0",
+    "tqdm>=4.70.0",
+]

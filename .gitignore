@@ -3,8 +3,20 @@ data/
 .DS_Store
 __pycache__/
 *.py[cod]
+
+# Virtual environment. pyproject.toml + uv.lock are tracked; the tree is not.
+.venv/
+
+# Checkpoints. savemodel/ is the live run; savemodel_* are archived runs kept as
+# fallbacks (savemodel_swin_t_run1 holds the 0.4474 weights).
 savemodel/
-eval_fig/
+savemodel_*/
+*.pth
+*.pt
 *.pkl
 *.onnx
 *.trt
+
+eval_fig/
+run*.log
+submission*.json

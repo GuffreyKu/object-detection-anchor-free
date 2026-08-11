@@ -151,3 +151,31 @@ def decode_bbox(prediction, input_shape, dev, image_shape=None, remove_pad=False
     return output
 
 
+def class_agnostic_nms(detections, nms_threshold=0.7, max_proposals=100):
+    """Merge class-specific detections into xyxy + objectness proposals."""
+    if len(detections) == 0:
+        return detections.new_zeros((0, 5))
+    from torchvision.ops import nms
+
+    keep = nms(detections[:, :4], detections[:, 4], nms_threshold)[:max_proposals]
+    return detections[keep, :5]
+
+
+def classifier_detections(proposals, probabilities, foreground_classes=34,
+                          score_threshold=0.001, nms_threshold=0.45,
+                          max_detections=100):
+    """Convert background-aware classifier probabilities into final detections."""
+    proposals = torch.as_tensor(proposals, dtype=torch.float32).reshape(-1, 5)
+    probabilities = torch.as_tensor(probabilities, dtype=torch.float32).reshape(
+        -1, foreground_classes + 1)
+    if len(proposals) == 0:
+        return proposals.new_zeros((0, 6))
+    rows, labels = torch.nonzero(
+        probabilities[:, :foreground_classes] >= score_threshold, as_tuple=True)
+    if len(rows) == 0:
+        return proposals.new_zeros((0, 6))
+    boxes = proposals[rows, :4]
+    scores = probabilities[rows, labels]
+    keep = batched_nms(boxes, scores, labels, nms_threshold)[:max_detections]
+    return torch.cat([boxes[keep], scores[keep, None], labels[keep, None].float()], dim=1)
+

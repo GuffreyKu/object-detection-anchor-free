@@ -346,3 +346,39 @@ def traced_func(model, saved_path, X):
     traced_model = torch.jit.trace(model, X)
     torch.jit.save(traced_model, saved_path)
     return traced_model
+
+
+def save_crop_classifier_checkpoint(path, model, optimizer, scheduler, epoch, best_map,
+                                    class_names, input_size=224, crop_expand=0.1,
+                                    proposal_topk=100):
+    """Atomically save the stage-2 classifier and its preprocessing contract."""
+    tmp = str(path) + ".tmp"
+    torch.save({
+        "epoch": epoch,
+        "best_map": best_map,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "class_names": list(class_names),
+        "background_index": len(class_names),
+        "input_size": input_size,
+        "crop_expand": crop_expand,
+        "proposal_topk": proposal_topk,
+    }, tmp)
+    os.replace(tmp, path)
+
+
+def load_crop_classifier_checkpoint(path, device, expected_class_names=None):
+    """Load and validate the classifier label/preprocessing contract."""
+    from model.centerNet import CropClassifier
+
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    class_names = checkpoint["class_names"]
+    if expected_class_names is not None and list(expected_class_names) != class_names:
+        raise RuntimeError("classifier class order does not match the annotation file")
+    if checkpoint.get("background_index") != len(class_names):
+        raise RuntimeError("classifier checkpoint has an invalid background index")
+    model = CropClassifier(len(class_names), pretrained=False).to(device)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
+    return model, checkpoint

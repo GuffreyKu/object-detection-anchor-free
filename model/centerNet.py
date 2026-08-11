@@ -244,3 +244,19 @@ if __name__ == "__main__":
     torch.onnx.export(model, dummy_input, "maxpool_model.onnx")
     traced_model = torch.jit.trace(model, dummy_input)
     torch.jit.save(traced_model, "../savemodel/maxpool.pt")
+
+
+class CropClassifier(nn.Module):
+    """Standalone ConvNeXt-Tiny classifier: 34 foreground classes + background."""
+
+    def __init__(self, foreground_classes=34, pretrained=True):
+        super().__init__()
+        from torchvision import models
+
+        weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+        self.net = models.convnext_tiny(weights=weights)
+        self.net.classifier[-1] = nn.Linear(
+            self.net.classifier[-1].in_features, foreground_classes + 1)
+
+    def forward(self, x):
+        return self.net(x)

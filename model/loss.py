@@ -116,3 +116,48 @@ class TotalLoss(nn.Module):
 
         return loss
 
+
+class HardNegativeCrossEntropy(nn.Module):
+    """Cross entropy plus a margin over the hardest class in the same confusion group."""
+
+    def __init__(self, num_classes, class_weights=None, hard_negative_groups=(),
+                 hard_weight=0.5, margin=0.2, label_smoothing=0.05):
+        super().__init__()
+        if hard_weight < 0 or margin < 0:
+            raise ValueError("hard-negative weight and margin must be non-negative")
+        self.hard_weight = hard_weight
+        self.margin = margin
+        self.label_smoothing = label_smoothing
+        self.register_buffer(
+            "class_weights", None if class_weights is None else class_weights.float())
+
+        mask = torch.zeros((num_classes, num_classes), dtype=torch.bool)
+        for group in hard_negative_groups:
+            group = torch.as_tensor(group, dtype=torch.long)
+            if len(group) and (group.min() < 0 or group.max() >= num_classes):
+                raise ValueError("hard-negative group contains an invalid class index")
+            for label in group:
+                mask[label, group] = True
+        mask.fill_diagonal_(False)
+        self.register_buffer("hard_negative_mask", mask)
+
+    def forward(self, logits, targets):
+        if logits.shape[-1] != self.hard_negative_mask.shape[0]:
+            raise ValueError("classifier output does not match hard-negative classes")
+        loss = F.cross_entropy(
+            logits, targets, weight=self.class_weights,
+            label_smoothing=self.label_smoothing)
+        eligible = self.hard_negative_mask[targets]
+        valid = eligible.any(dim=1)
+        if self.hard_weight == 0 or not valid.any():
+            return loss
+
+        hard_logits = logits[valid].masked_fill(~eligible[valid], -torch.inf).max(1).values
+        true_logits = logits[valid].gather(1, targets[valid, None]).squeeze(1)
+        hard_loss = F.relu(hard_logits + self.margin - true_logits)
+        if self.class_weights is not None:
+            weights = self.class_weights[targets[valid]]
+            hard_loss = (hard_loss * weights).sum() / weights.sum().clamp_min(1e-12)
+        else:
+            hard_loss = hard_loss.mean()
+        return loss + self.hard_weight * hard_loss

@@ -228,3 +228,59 @@ class ImgDataset(Dataset):
 
     def __len__(self):
         return len(self.annotation) * self.repeat
+
+
+class CropDataset(Dataset):
+    """Crops original RGB images for the standalone stage-2 classifier."""
+
+    def __init__(self, samples, train=False, size=224, expand=0.1):
+        self.samples = list(samples)
+        self.train = train
+        self.size = size
+        self.expand = expand
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        import math
+        from .dataUtils import crop_and_letterbox
+
+        sample = self.samples[index]
+        image = read_image_rgb(sample["path"])
+        crop = crop_and_letterbox(image, sample["box"], self.size, self.expand)
+        if self.train and random.random() < 0.5:
+            crop = np.ascontiguousarray(crop[:, ::-1])
+        if self.train:
+            gamma = math.exp(random.uniform(-0.2, 0.2))
+            crop = (255 * (crop.astype(np.float32) / 255) ** gamma).astype(np.uint8)
+        return to_chw_tensor(crop), int(sample["label"])
+
+
+class ProposalCropDataset(Dataset):
+    """Flatten cached proposal records into classifier crops."""
+
+    def __init__(self, records, size=224, expand=0.1):
+        self.records = records
+        self.size = size
+        self.expand = expand
+        self.index = [(ri, pi) for ri, record in enumerate(records)
+                      for pi in range(len(record["proposals"]))]
+        self._cached_path = None
+        self._cached_image = None
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, index):
+        from .dataUtils import crop_and_letterbox
+
+        record_id, proposal_id = self.index[index]
+        record = self.records[record_id]
+        if record["path"] != self._cached_path:
+            self._cached_path = record["path"]
+            self._cached_image = read_image_rgb(record["path"])
+        crop = crop_and_letterbox(
+            self._cached_image, record["proposals"][proposal_id][:4],
+            self.size, self.expand)
+        return to_chw_tensor(crop), record_id, proposal_id

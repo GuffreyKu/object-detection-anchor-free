@@ -179,3 +179,15 @@ class DetectionEval:
                                        group_of(class_names)[class_names.index(p)] else ""
                 lines.append(f"  {n:5}  {t[:28]:30} -> {p[:28]:30} {same}")
         return "\n".join(lines)
+
+
+def proposal_recall(records, iou_threshold=0.5, topk=50):
+    """Fraction of ground-truth boxes covered by any of the top-K proposals."""
+    hit = total = 0
+    for record in records:
+        gt = np.asarray(record["gt_boxes"], np.float32).reshape(-1, 4)
+        proposals = np.asarray(record["proposals"], np.float32).reshape(-1, 5)[:topk, :4]
+        total += len(gt)
+        if len(gt) and len(proposals):
+            hit += int((iou_matrix(gt, proposals).max(1) >= iou_threshold).sum())
+    return hit / max(1, total)

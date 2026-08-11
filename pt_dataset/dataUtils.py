@@ -308,3 +308,25 @@ class Mosaic:
         all_bboxes.extend(self.adjust_bboxes(resized_bboxes_list[3], w // 2, h // 2))
 
         return mosaic_image, all_bboxes
+
+
+def crop_and_letterbox(image, box, size=224, expand=0.1, fill=114):
+    """Expand an xyxy box, crop it, and preserve its aspect ratio in a square canvas."""
+    raw_h, raw_w = image.shape[:2]
+    x1, y1, x2, y2 = (float(v) for v in box)
+    w, h = x2 - x1, y2 - y1
+    if w <= 0 or h <= 0:
+        raise ValueError(f"invalid crop box: {box}")
+    x1, x2 = max(0, math.floor(x1 - w * expand)), min(raw_w, math.ceil(x2 + w * expand))
+    y1, y2 = max(0, math.floor(y1 - h * expand)), min(raw_h, math.ceil(y2 + h * expand))
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        raise ValueError(f"crop outside image: {box}")
+    scale = min(size / crop.shape[1], size / crop.shape[0])
+    new_w = max(1, round(crop.shape[1] * scale))
+    new_h = max(1, round(crop.shape[0] * scale))
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.full((size, size, 3), fill, np.uint8)
+    left, top = (size - new_w) // 2, (size - new_h) // 2
+    canvas[top:top + new_h, left:left + new_w] = resized
+    return canvas

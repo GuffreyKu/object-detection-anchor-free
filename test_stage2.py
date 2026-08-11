@@ -11,6 +11,7 @@ from utils.tool import (
     collapse_annotations,
     crop_sample_weights,
     crop_samples_from_records,
+    filter_invalid_proposals,
     select_proposal_topk,
 )
 
@@ -26,6 +27,7 @@ def test_crop_and_letterbox_preserves_shape():
 
 def test_class_agnostic_nms_merges_classes():
     detections = torch.tensor([
+        [10., 0., 0., 10., .95, 1.],
         [0., 0., 10., 10., .9, 0.],
         [0., 0., 10., 10., .8, 7.],
         [20., 20., 30., 30., .7, 2.],
@@ -33,6 +35,14 @@ def test_class_agnostic_nms_merges_classes():
     proposals = class_agnostic_nms(detections, 0.7, 100)
     assert proposals.shape == (2, 5)
     assert torch.allclose(proposals[:, 4], torch.tensor([0.9, 0.7]))
+
+
+def test_invalid_cached_proposals_are_removed():
+    records = [{"proposals": [
+        [569.52, 452.05, 569.43, 571.88, .9],
+        [0, 0, 10, 10, .8],
+    ]}]
+    assert filter_invalid_proposals(records)[0]["proposals"] == [[0, 0, 10, 10, .8]]
 
 
 def test_classifier_score_does_not_multiply_objectness():
@@ -102,6 +112,7 @@ def test_hard_negative_loss_uses_same_group_hardest_logit():
 if __name__ == "__main__":
     test_crop_and_letterbox_preserves_shape()
     test_class_agnostic_nms_merges_classes()
+    test_invalid_cached_proposals_are_removed()
     test_classifier_score_does_not_multiply_objectness()
     test_crop_sample_iou_bands_and_background_mass()
     test_proposal_recall_and_safe_topk()

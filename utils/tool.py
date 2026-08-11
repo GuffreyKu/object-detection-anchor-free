@@ -326,6 +326,22 @@ def proposal_cache_metadata(weights_path, backbone, class_agnostic, *, keep_stag
     }
 
 
+def filter_invalid_proposals(records):
+    """Drop non-finite or non-positive-area boxes, including those in an old cache."""
+    dropped = 0
+    for record in records:
+        proposals = record["proposals"]
+        record["proposals"] = [
+            proposal for proposal in proposals
+            if (len(proposal) >= 5 and np.isfinite(proposal[:5]).all()
+                and proposal[2] > proposal[0] and proposal[3] > proposal[1])
+        ]
+        dropped += len(proposals) - len(record["proposals"])
+    if dropped:
+        print(f"ignored {dropped} invalid detector proposals")
+    return records
+
+
 def load_or_generate_proposal_records(path, annotations, model, device, metadata,
                                       rebuild=False):
     from pathlib import Path
@@ -336,14 +352,14 @@ def load_or_generate_proposal_records(path, annotations, model, device, metadata
             payload = json.load(file)
         if payload.get("metadata") != metadata:
             raise RuntimeError(f"stale proposal cache: {path}; use --rebuild-manifest")
-        return payload["records"]
-    records = generate_proposal_records(
+        return filter_invalid_proposals(payload["records"])
+    records = filter_invalid_proposals(generate_proposal_records(
         annotations, model, device,
         keep_stage1=metadata["keep_stage1"],
         input_shape=tuple(metadata["input_shape"]),
         confidence=metadata["confidence"], topk=metadata["topk"],
         proposal_nms=metadata["proposal_nms"],
-        max_proposals=metadata["max_proposals"])
+        max_proposals=metadata["max_proposals"]))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w") as file:

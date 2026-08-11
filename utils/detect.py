@@ -157,6 +157,12 @@ def class_agnostic_nms(detections, nms_threshold=0.7, max_proposals=100):
         return detections.new_zeros((0, 5))
     from torchvision.ops import nms
 
+    valid = (torch.isfinite(detections[:, :5]).all(1)
+             & (detections[:, 2] > detections[:, 0])
+             & (detections[:, 3] > detections[:, 1]))
+    detections = detections[valid]
+    if len(detections) == 0:
+        return detections.new_zeros((0, 5))
     keep = nms(detections[:, :4], detections[:, 4], nms_threshold)[:max_proposals]
     return detections[keep, :5]
 
@@ -178,4 +184,3 @@ def classifier_detections(proposals, probabilities, foreground_classes=34,
     scores = probabilities[rows, labels]
     keep = batched_nms(boxes, scores, labels, nms_threshold)[:max_detections]
     return torch.cat([boxes[keep], scores[keep, None], labels[keep, None].float()], dim=1)
-

@@ -1,10 +1,14 @@
 """Small offline checks for the added two-stage path."""
 
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import torch
 
 from pt_dataset.dataUtils import crop_and_letterbox, crop_centered_or_letterbox
 from model.loss import HardNegativeCrossEntropy
+from train_two_stage import build_commands, parse_args
 from utils.detect import class_agnostic_nms, classifier_detections
 from utils.metrics import proposal_recall
 from utils.tool import (
@@ -121,6 +125,22 @@ def test_hard_negative_loss_uses_same_group_hardest_logit():
     assert logits.grad[0, 0] < 0 and logits.grad[0, 1] > 0
 
 
+def test_full_training_pipeline_wires_both_models():
+    with tempfile.TemporaryDirectory() as tmp:
+        output = Path(tmp)
+        (output / "proposal").mkdir()
+        (output / "classifier").mkdir()
+        (output / "proposal" / "last.pth").touch()
+        (output / "classifier" / "last.pth").touch()
+        args = parse_args(["--output-dir", tmp, "--resume"])
+        proposal, classifier, weights = build_commands(args)
+
+        assert proposal[proposal.index("--resume") + 1].endswith("proposal/last.pth")
+        assert classifier[classifier.index("--resume") + 1].endswith("classifier/last.pth")
+        assert classifier[classifier.index("--detector-weights") + 1] == str(weights)
+        assert "--detector-class-agnostic" in classifier
+
+
 if __name__ == "__main__":
     test_crop_and_letterbox_preserves_shape()
     test_small_box_uses_native_scale_center_crop()
@@ -131,4 +151,5 @@ if __name__ == "__main__":
     test_proposal_recall_and_safe_topk()
     test_collapse_annotations_does_not_mutate_input()
     test_hard_negative_loss_uses_same_group_hardest_logit()
+    test_full_training_pipeline_wires_both_models()
     print("ok")

@@ -330,3 +330,28 @@ def crop_and_letterbox(image, box, size=224, expand=0.1, fill=114):
     left, top = (size - new_w) // 2, (size - new_h) // 2
     canvas[top:top + new_h, left:left + new_w] = resized
     return canvas
+
+
+def crop_centered_or_letterbox(image, box, size=224, expand=0.1, fill=114):
+    """Center-crop small boxes at native scale; resize only boxes larger than size."""
+    x1, y1, x2, y2 = (float(v) for v in box)
+    w, h = x2 - x1, y2 - y1
+    if w <= 0 or h <= 0:
+        raise ValueError(f"invalid crop box: {box}")
+    if w > size or h > size:
+        return crop_and_letterbox(image, box, size, expand, fill)
+
+    raw_h, raw_w = image.shape[:2]
+    left = round((x1 + x2 - size) / 2)
+    top = round((y1 + y2 - size) / 2)
+    right, bottom = left + size, top + size
+    src_x1, src_y1 = max(0, left), max(0, top)
+    src_x2, src_y2 = min(raw_w, right), min(raw_h, bottom)
+    if src_x1 >= src_x2 or src_y1 >= src_y2:
+        raise ValueError(f"crop outside image: {box}")
+
+    canvas = np.full((size, size, 3), fill, np.uint8)
+    dst_x, dst_y = src_x1 - left, src_y1 - top
+    canvas[dst_y:dst_y + src_y2 - src_y1,
+           dst_x:dst_x + src_x2 - src_x1] = image[src_y1:src_y2, src_x1:src_x2]
+    return canvas

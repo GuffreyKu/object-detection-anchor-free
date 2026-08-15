@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from pt_dataset.dataUtils import crop_and_letterbox
+from pt_dataset.dataUtils import crop_and_letterbox, crop_centered_or_letterbox
 from model.loss import HardNegativeCrossEntropy
 from utils.detect import class_agnostic_nms, classifier_detections
 from utils.metrics import proposal_recall
@@ -23,6 +23,18 @@ def test_crop_and_letterbox_preserves_shape():
     assert crop.shape == (64, 64, 3)
     assert (crop[0] == 114).all() and (crop[-1] == 114).all()
     assert tuple(crop[32, 32]) == (10, 20, 30)
+
+
+def test_small_box_uses_native_scale_center_crop():
+    image = np.zeros((300, 300, 3), np.uint8)
+    image[140:160, 140:160] = 255
+    crop = crop_centered_or_letterbox(image, [140, 140, 160, 160])
+    assert crop.shape == (224, 224, 3)
+    assert (crop[102:122, 102:122] == 255).all()
+    assert (crop[..., 0] == 255).sum() == 20 * 20
+
+    edge = crop_centered_or_letterbox(image, [0, 0, 20, 20])
+    assert (edge[0, 0] == 114).all()
 
 
 def test_class_agnostic_nms_merges_classes():
@@ -111,6 +123,7 @@ def test_hard_negative_loss_uses_same_group_hardest_logit():
 
 if __name__ == "__main__":
     test_crop_and_letterbox_preserves_shape()
+    test_small_box_uses_native_scale_center_crop()
     test_class_agnostic_nms_merges_classes()
     test_invalid_cached_proposals_are_removed()
     test_classifier_score_does_not_multiply_objectness()

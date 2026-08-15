@@ -244,11 +244,12 @@ class CropDataset(Dataset):
 
     def __getitem__(self, index):
         import math
-        from .dataUtils import crop_and_letterbox
+        from .dataUtils import crop_centered_or_letterbox
 
         sample = self.samples[index]
         image = read_image_rgb(sample["path"])
-        crop = crop_and_letterbox(image, sample["box"], self.size, self.expand)
+        crop = crop_centered_or_letterbox(
+            image, sample["box"], self.size, self.expand)
         if self.train and random.random() < 0.5:
             crop = np.ascontiguousarray(crop[:, ::-1])
         if self.train:
@@ -273,14 +274,14 @@ class ProposalCropDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, index):
-        from .dataUtils import crop_and_letterbox
+        from .dataUtils import crop_centered_or_letterbox
 
         record_id, proposal_id = self.index[index]
         record = self.records[record_id]
         if record["path"] != self._cached_path:
             self._cached_path = record["path"]
             self._cached_image = read_image_rgb(record["path"])
-        crop = crop_and_letterbox(
+        crop = crop_centered_or_letterbox(
             self._cached_image, record["proposals"][proposal_id][:4],
             self.size, self.expand)
         return to_chw_tensor(crop), record_id, proposal_id

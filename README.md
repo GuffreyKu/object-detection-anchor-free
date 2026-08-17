@@ -8,6 +8,11 @@ See [docs/DATASET.md](docs/DATASET.md) for the distribution analysis and what it
 for modelling — class imbalance, stride choice, augmentation limits, and the known
 blockers on mAP@0.5.
 
+See [docs/STAGE2_EVAL.md](docs/STAGE2_EVAL.md) for `savemodel_two_stage`'s measured
+mAP@0.5, per-class breakdown, and where the two-stage pipeline's errors actually come
+from — proposal recall vs classifier confusion, and which class confusions are not
+covered by the semantic groups in DATASET.md §7.3.
+
 ## Dataset
 * COCO-style json, images on local disk.
 * `data/train_dataset/train_label.json` plus `data/train_dataset/images/`.

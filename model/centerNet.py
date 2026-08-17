@@ -3,6 +3,7 @@ os.environ['KMP_DUPLICATE_LIB_OK']='True'
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.ops import roi_align
 
 from model.backnone import build_backbone
@@ -246,17 +247,38 @@ if __name__ == "__main__":
     torch.jit.save(traced_model, "../savemodel/maxpool.pt")
 
 
+class ArcMarginHead(nn.Module):
+    """Cosine-similarity classification head for ArcFace-style training.
+
+    Outputs raw cosine similarities in [-1, 1] - no scale, no margin. Both are applied in
+    the loss (model/loss.py: HardNegativeCrossEntropy(arc_margin=..., arc_scale=...))
+    instead of here, because the margin only touches the true class's logit and needs the
+    label, which this forward(x) does not receive.
+    """
+
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x):
+        return F.linear(F.normalize(x), F.normalize(self.weight))
+
+
 class CropClassifier(nn.Module):
     """Standalone ConvNeXt-Tiny classifier: 34 foreground classes + background."""
 
-    def __init__(self, foreground_classes=34, pretrained=True):
+    def __init__(self, foreground_classes=34, pretrained=True, arc_margin=False):
         super().__init__()
         from torchvision import models
 
         weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
         self.net = models.convnext_tiny(weights=weights)
-        self.net.classifier[-1] = nn.Linear(
-            self.net.classifier[-1].in_features, foreground_classes + 1)
+        in_features = self.net.classifier[-1].in_features
+        out_features = foreground_classes + 1
+        self.net.classifier[-1] = (
+            ArcMarginHead(in_features, out_features) if arc_margin
+            else nn.Linear(in_features, out_features))
 
     def forward(self, x):
         return self.net(x)

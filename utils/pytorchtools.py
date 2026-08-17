@@ -350,7 +350,8 @@ def traced_func(model, saved_path, X):
 
 def save_crop_classifier_checkpoint(path, model, optimizer, scheduler, epoch, best_map,
                                     class_names, input_size=224, crop_expand=0.1,
-                                    proposal_topk=100):
+                                    proposal_topk=100, arc_margin=False,
+                                    early_stopping=None):
     """Atomically save the stage-2 classifier and its preprocessing contract."""
     tmp = str(path) + ".tmp"
     torch.save({
@@ -364,6 +365,11 @@ def save_crop_classifier_checkpoint(path, model, optimizer, scheduler, epoch, be
         "input_size": input_size,
         "crop_expand": crop_expand,
         "proposal_topk": proposal_topk,
+        # Which head shape model.state_dict() needs on load - see model/centerNet.py:
+        # CropClassifier(arc_margin=...). Missing on checkpoints saved before this existed
+        # -> .get(..., False) below reconstructs the plain nn.Linear head they actually have.
+        "arc_margin": arc_margin,
+        "early_stopping": early_stopping.state_dict() if early_stopping is not None else None,
     }, tmp)
     os.replace(tmp, path)
 
@@ -378,7 +384,8 @@ def load_crop_classifier_checkpoint(path, device, expected_class_names=None):
         raise RuntimeError("classifier class order does not match the annotation file")
     if checkpoint.get("background_index") != len(class_names):
         raise RuntimeError("classifier checkpoint has an invalid background index")
-    model = CropClassifier(len(class_names), pretrained=False).to(device)
+    model = CropClassifier(len(class_names), pretrained=False,
+                           arc_margin=checkpoint.get("arc_margin", False)).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     return model, checkpoint

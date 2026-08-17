@@ -19,6 +19,7 @@ from model.loss import HardNegativeCrossEntropy, inverse_sqrt_class_weights
 from pt_dataset.dataset import CropDataset
 from utils.metrics import GROUPS, proposal_recall
 from utils.pytorchtools import (
+    EarlyStopping,
     amp_dtype,
     get_device,
     load_crop_classifier_checkpoint,
@@ -60,6 +61,17 @@ def parse_args():
     parser.add_argument("--hard-negative-weight", type=float, default=0.5)
     parser.add_argument("--hard-negative-margin", type=float, default=0.2)
     parser.add_argument("--rare-loss-cap", type=float, default=4.0)
+    parser.add_argument("--patience", type=int, default=8,
+                        help="stop after this many epochs with no two-stage mAP "
+                             "improvement (docs/STAGE2_EVAL.md: a prior run's mAP "
+                             "peaked at epoch 3 of 30 and never improved again)")
+    parser.add_argument("--arc-margin", type=float, default=0.0,
+                        help="ArcFace additive angular margin in radians on the crop "
+                             "classifier head; 0 (default) keeps the plain Linear head "
+                             "and prior behaviour. Experimental - see model/loss.py: "
+                             "HardNegativeCrossEntropy and docs/STAGE2_EVAL.md")
+    parser.add_argument("--arc-scale", type=float, default=30.0,
+                        help="ArcFace logit scale, only used when --arc-margin > 0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-amp", action="store_true")
     return parser.parse_args()
@@ -133,17 +145,21 @@ def main():
         model, checkpoint = load_crop_classifier_checkpoint(
             args.resume, device, expected_class_names=class_names)
     else:
-        model = CropClassifier(len(class_names), pretrained=True).to(device)
+        model = CropClassifier(
+            len(class_names), pretrained=True, arc_margin=args.arc_margin > 0).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = cosine_with_warmup(
         optimizer, args.epochs * len(train_loader), len(train_loader))
+    early_stopping = EarlyStopping(patience=args.patience, verbose=False)
     start_epoch, best_map = 0, 0.0
     if checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = checkpoint["epoch"] + 1
         best_map = checkpoint.get("best_map", 0.0)
+        if checkpoint.get("early_stopping"):
+            early_stopping.load_state_dict(checkpoint["early_stopping"])
     counts = np.bincount(
         [sample["label"] for sample in train_samples], minlength=len(class_names) + 1)
     class_weights = inverse_sqrt_class_weights(
@@ -156,11 +172,15 @@ def main():
     ]
     criterion = HardNegativeCrossEntropy(
         len(class_names) + 1, class_weights, hard_negative_groups,
-        args.hard_negative_weight, args.hard_negative_margin).to(device)
+        args.hard_negative_weight, args.hard_negative_margin,
+        arc_margin=args.arc_margin, arc_scale=args.arc_scale).to(device)
     rarest = int(counts[:len(class_names)].argmin())
     print(f"hard negatives: weight={args.hard_negative_weight}, "
           f"margin={args.hard_negative_margin}; rarest {class_names[rarest]} "
           f"n={counts[rarest]}, loss weight={class_weights[rarest]:.2f}")
+    if args.arc_margin > 0:
+        print(f"arc margin ON: margin={args.arc_margin} rad, scale={args.arc_scale} "
+              f"- experimental, see docs/STAGE2_EVAL.md")
     scaler = make_scaler(device, enabled=not args.no_amp)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -199,12 +219,20 @@ def main():
             best_map = map50
         save_crop_classifier_checkpoint(
             output_dir / "last.pth", model, optimizer, scheduler, epoch, best_map,
-            class_names, proposal_topk=proposal_topk)
+            class_names, proposal_topk=proposal_topk, arc_margin=args.arc_margin > 0,
+            early_stopping=early_stopping)
         if improved:
             save_crop_classifier_checkpoint(
                 output_dir / "best.pth", model, optimizer, scheduler, epoch, best_map,
-                class_names, proposal_topk=proposal_topk)
+                class_names, proposal_topk=proposal_topk, arc_margin=args.arc_margin > 0,
+                early_stopping=early_stopping)
             print(evaluator.report(class_names))
+
+        early_stopping(-map50)
+        if early_stopping.early_stop:
+            print(f"epoch {epoch}: no two-stage mAP improvement in {args.patience} "
+                  f"epochs, stopping (best {best_map:.4f})")
+            break
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from torch.utils.data.dataset import Dataset
 from .dataUtils import (Augment, Mosaic, encode_targets, aug_retangle, to_chw_tensor,
-                        read_image_rgb)
+                        read_image_rgb, crop_centered_or_letterbox)
 
 def adjust_contrast(image, alpha, beta):
     # New image with adjusted contrast: new_image = alpha*image + beta
@@ -231,30 +231,67 @@ class ImgDataset(Dataset):
 
 
 class CropDataset(Dataset):
-    """Crops original RGB images for the standalone stage-2 classifier."""
+    """Crops original RGB images for the standalone stage-2 classifier.
 
-    def __init__(self, samples, train=False, size=224, expand=0.1):
+    Training augmentation used to be just flip + gamma - much weaker than the detector's
+    own Augment (docs/DATASET.md 11.2), which let a pretrained ConvNeXt-Tiny memorise the
+    crop set quickly (docs/STAGE2_EVAL.md: validation mAP peaked at epoch 3 of 30 and
+    never improved again). Now reuses the detector's hue/sat/gamma jitter directly - same
+    conservative hue range, since colour is one of the few cues separating the container
+    classes (DATASET.md 7.3/13) - plus a Gaussian blur and a random box jitter.
+
+    The box jitter is deliberate, not just more noise for noise's sake: this classifier is
+    fed stage-1 PROPOSALS at inference time, not perfect GT boxes, and proposal_recall at
+    IoU 0.75 is only ~49% (docs/STAGE2_EVAL.md 2) - i.e. real boxes are frequently loose.
+    Training only on perfectly-centred GT crops teaches the classifier a box quality it
+    will not see in production.
+    """
+
+    def __init__(self, samples, train=False, size=224, expand=0.1,
+                 box_jitter_scale=0.15, box_jitter_translate=0.1, blur_p=0.1):
         self.samples = list(samples)
         self.train = train
         self.size = size
         self.expand = expand
+        self.box_jitter_scale = box_jitter_scale
+        self.box_jitter_translate = box_jitter_translate
+        self.blur_p = blur_p
+        self.photometric = Augment(hue=6, sat=0.3, gamma=0.3)
 
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, index):
-        import math
-        from .dataUtils import crop_centered_or_letterbox
+    def _jitter_box(self, box):
+        x1, y1, x2, y2 = box
+        w, h = x2 - x1, y2 - y1
+        s = random.uniform(1 - self.box_jitter_scale, 1 + self.box_jitter_scale)
+        cx = (x1 + x2) / 2 + random.uniform(
+            -self.box_jitter_translate, self.box_jitter_translate) * w
+        cy = (y1 + y2) / 2 + random.uniform(
+            -self.box_jitter_translate, self.box_jitter_translate) * h
+        w, h = w * s, h * s
+        return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
 
+    def __getitem__(self, index):
         sample = self.samples[index]
         image = read_image_rgb(sample["path"])
-        crop = crop_centered_or_letterbox(
-            image, sample["box"], self.size, self.expand)
+        box = sample["box"]
+        if self.train:
+            try:
+                crop = crop_centered_or_letterbox(
+                    image, self._jitter_box(box), self.size, self.expand)
+            except ValueError:
+                # Jitter pushed the box fully off-frame (rare, near an image edge).
+                crop = crop_centered_or_letterbox(image, box, self.size, self.expand)
+        else:
+            crop = crop_centered_or_letterbox(image, box, self.size, self.expand)
+
         if self.train and random.random() < 0.5:
             crop = np.ascontiguousarray(crop[:, ::-1])
         if self.train:
-            gamma = math.exp(random.uniform(-0.2, 0.2))
-            crop = (255 * (crop.astype(np.float32) / 255) ** gamma).astype(np.uint8)
+            crop = self.photometric.hsv_jitter(crop)
+            if random.random() < self.blur_p:
+                crop = cv2.GaussianBlur(crop, (5, 5), random.uniform(0.1, 1.2))
         return to_chw_tensor(crop), int(sample["label"])
 
 

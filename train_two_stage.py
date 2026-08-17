@@ -17,7 +17,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--annotation", default="data/train_dataset/train_label.json")
     parser.add_argument("--output-dir", default="savemodel_two_stage")
-    parser.add_argument("--proposal-backbone", default="mobilenet_v3_large")
+    parser.add_argument("--proposal-backbone", default="swin_t")
     parser.add_argument("--proposal-epochs", type=int, default=120)
     parser.add_argument("--proposal-batch-size", type=int, default=32)
     parser.add_argument("--classifier-epochs", type=int, default=30)

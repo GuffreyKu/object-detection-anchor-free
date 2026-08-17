@@ -1,7 +1,7 @@
 """Run detector -> crop classifier inference over a folder."""
 
 import argparse
-import json
+import csv
 import os
 from pathlib import Path
 
@@ -24,7 +24,7 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--images", required=True)
-    parser.add_argument("--output", default="submission_stage2.json")
+    parser.add_argument("--output", default="submission_stage2.csv")
     parser.add_argument("--detector-weights", required=True)
     parser.add_argument("--detector-backbone", default="swin_t")
     parser.add_argument("--detector-class-agnostic", action="store_true")
@@ -65,21 +65,25 @@ def main():
                 proposals, probabilities, len(class_names), args.score_threshold,
                 0.45, args.max_detections).numpy()
             for x1, y1, x2, y2, score, label in detections:
-                label = int(label)
                 results.append({
-                    "image_id": os.path.splitext(filename)[0],
-                    "category_id": label,
-                    "category_name": class_names[label],
-                    "bbox": [round(float(x1), 2), round(float(y1), 2),
-                             round(float(x2 - x1), 2), round(float(y2 - y1), 2)],
-                    "score": round(float(score), 5),
+                    "image_filename": filename,
+                    "label_id": int(label),
+                    "x": round(float(x1), 2),
+                    "y": round(float(y1), 2),
+                    "w": round(float(x2 - x1), 2),
+                    "h": round(float(y2 - y1), 2),
+                    "confidence": round(float(score), 5),
                 })
             if index % 200 == 0:
                 print(f"{index}/{len(files)}", flush=True)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(results))
+    with open(output, "w", newline="") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=["image_filename", "label_id", "x", "y", "w", "h", "confidence"])
+        writer.writeheader()
+        writer.writerows(results)
     print(f"wrote {output}: {len(results)} detections over {len(files)} images")
 
 

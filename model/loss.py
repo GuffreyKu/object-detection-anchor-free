@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -118,16 +120,38 @@ class TotalLoss(nn.Module):
 
 
 class HardNegativeCrossEntropy(nn.Module):
-    """Cross entropy plus a margin over the hardest class in the same confusion group."""
+    """Cross entropy plus a margin over the hardest class in the same confusion group.
+
+    arc_margin/arc_scale optionally add an ArcFace-style additive angular margin (Deng et
+    al. 2019) ahead of the softmax. When enabled, `logits` must be COSINE SIMILARITIES in
+    [-1, 1] - i.e. the classifier's final layer has to be a normalised-embedding /
+    normalised-weight head (CropClassifier(arc_margin=True) in model/centerNet.py), not a
+    plain Linear. The margin is applied here rather than in the model because it only
+    touches the true class's angle and needs the label, which forward(x) alone doesn't
+    have. The hard-negative margin term below still reads the pre-margin, pre-scale
+    cosine values, so `margin` keeps the same [-1, 1]-scale meaning whether or not arc
+    mode is on.
+
+    arc_margin=0 (the default) reproduces the exact prior behaviour bit-for-bit. This is
+    experimental and untested against this dataset's class imbalance (13 to 6000+
+    samples/class): an angular margin asks every class to carve out its own angular
+    region, and the rarest classes may not have enough samples to do that safely. See
+    docs/STAGE2_EVAL.md.
+    """
 
     def __init__(self, num_classes, class_weights=None, hard_negative_groups=(),
-                 hard_weight=0.5, margin=0.2, label_smoothing=0.05):
+                 hard_weight=0.5, margin=0.2, label_smoothing=0.05,
+                 arc_margin=0.0, arc_scale=30.0):
         super().__init__()
         if hard_weight < 0 or margin < 0:
             raise ValueError("hard-negative weight and margin must be non-negative")
+        if arc_margin < 0 or arc_scale <= 0:
+            raise ValueError("arc margin must be non-negative and arc scale positive")
         self.hard_weight = hard_weight
         self.margin = margin
         self.label_smoothing = label_smoothing
+        self.arc_margin = arc_margin
+        self.arc_scale = arc_scale
         self.register_buffer(
             "class_weights", None if class_weights is None else class_weights.float())
 
@@ -141,9 +165,21 @@ class HardNegativeCrossEntropy(nn.Module):
         mask.fill_diagonal_(False)
         self.register_buffer("hard_negative_mask", mask)
 
+    def _arc_logits(self, cosine, targets):
+        """cosine: (N, C) in [-1, 1]. Adds `arc_margin` to the true class's angle only,
+        then rescales - the standard ArcFace transform."""
+        cosine = cosine.clamp(-1 + 1e-7, 1 - 1e-7)
+        theta = torch.acos(cosine)
+        target_theta = theta.gather(1, targets[:, None]) + self.arc_margin
+        target_cosine = torch.cos(target_theta.clamp(max=math.pi))
+        return cosine.scatter(1, targets[:, None], target_cosine) * self.arc_scale
+
     def forward(self, logits, targets):
         if logits.shape[-1] != self.hard_negative_mask.shape[0]:
             raise ValueError("classifier output does not match hard-negative classes")
+        raw = logits
+        if self.arc_margin > 0:
+            logits = self._arc_logits(logits, targets)
         loss = F.cross_entropy(
             logits, targets, weight=self.class_weights,
             label_smoothing=self.label_smoothing)
@@ -152,8 +188,8 @@ class HardNegativeCrossEntropy(nn.Module):
         if self.hard_weight == 0 or not valid.any():
             return loss
 
-        hard_logits = logits[valid].masked_fill(~eligible[valid], -torch.inf).max(1).values
-        true_logits = logits[valid].gather(1, targets[valid, None]).squeeze(1)
+        hard_logits = raw[valid].masked_fill(~eligible[valid], -torch.inf).max(1).values
+        true_logits = raw[valid].gather(1, targets[valid, None]).squeeze(1)
         hard_loss = F.relu(hard_logits + self.margin - true_logits)
         if self.class_weights is not None:
             weights = self.class_weights[targets[valid]]
